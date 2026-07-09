@@ -7,12 +7,19 @@ const LOG_FILE = path.join('output', 'eneba_monitor.jsonl');
 const STATE_FILE = path.join('output', 'last_price.json');
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-interface PriceRecord {
-    timestamp: string;
+interface VariantPrice {
+    slug: string;
+    name: string;
+    valueLabel: string;
     price: number | null;
     currency: string | null;
     seller: string | null;
     inStock: boolean;
+}
+
+interface PriceRecord {
+    timestamp: string;
+    variants: VariantPrice[];
 }
 
 async function sendDiscordAlert(message: string) {
@@ -40,6 +47,46 @@ function writeLastPrice(record: PriceRecord) {
 function appendLog(record: PriceRecord) {
     fs.mkdirSync('output', { recursive: true });
     fs.appendFileSync(LOG_FILE, JSON.stringify(record) + '\n');
+}
+
+function extractVariants(capturedData: any): VariantPrice[] {
+    const product = capturedData?.data?.productNoCache;
+    const variantsEdges = capturedData?.data?.productVariants?.results?.edges ?? [];
+
+    const variants: VariantPrice[] = [];
+
+    if (product) {
+        const cheapestMain = product.auctions?.edges
+            ?.map((e: any) => e.node)
+            ?.filter((n: any) => n.isInStock)
+            ?.sort((a: any, b: any) => a.price.amount - b.price.amount)[0];
+
+        variants.push({
+            slug: product.slug,
+            name: product.slug,
+            valueLabel: 'main',
+            price: cheapestMain?.price?.amount ?? null,
+            currency: cheapestMain?.price?.currency ?? null,
+            seller: cheapestMain?.merchant?.displayname ?? null,
+            inStock: !!cheapestMain,
+        });
+    }
+
+    for (const edge of variantsEdges) {
+        const node = edge.node;
+        const cheapest = node.cheapestAuction;
+        variants.push({
+            slug: node.slug,
+            name: node.name,
+            valueLabel: node.productValue?.valueLabel ?? '',
+            price: cheapest?.price?.amount ?? null,
+            currency: cheapest?.price?.currency ?? null,
+            seller: cheapest?.merchant?.displayname ?? null,
+            inStock: cheapest?.isInStock ?? false,
+        });
+    }
+
+    return variants;
 }
 
 async function checkPrice(): Promise<PriceRecord> {
@@ -70,57 +117,81 @@ async function checkPrice(): Promise<PriceRecord> {
 
     try {
         await page.goto(PRODUCT_URL, { waitUntil: 'networkidle', timeout: 60000 });
-        // petit délai aléatoire pour éviter un pattern trop robotique
         await page.waitForTimeout(1000 + Math.random() * 2000);
     } finally {
         await browser.close();
     }
 
     const timestamp = new Date().toISOString();
+    const variants = capturedData ? extractVariants(capturedData) : [];
 
-    if (!capturedData) {
-        return { timestamp, price: null, currency: null, seller: null, inStock: false };
-    }
+    return { timestamp, variants };
+}
 
-    const product = capturedData?.data?.product;
-    const cheapest = product?.stock?.competition ?? product?.stock?.cheapestAuction;
-
-    return {
-        timestamp,
-        price: cheapest?.price?.amount ?? null,
-        currency: cheapest?.price?.currency ?? null,
-        seller: cheapest?.seller?.username ?? null,
-        inStock: !!cheapest,
-    };
+function isProfitable(variant: VariantPrice): boolean {
+    const faceValueMatch = variant.valueLabel.match(/(\d+)\s*EUR/);
+    if (!faceValueMatch || variant.price === null) return false;
+    const faceValueCents = parseInt(faceValueMatch[1]) * 100;
+    return variant.price < faceValueCents;
 }
 
 async function main() {
     const current = await checkPrice();
+
+    const profitableVariants = current.variants.filter(isProfitable);
+    const filteredRecord: PriceRecord = {
+        timestamp: current.timestamp,
+        variants: profitableVariants,
+    };
+
     const previous = readLastPrice();
 
-    appendLog(current);
-    writeLastPrice(current);
+    appendLog(filteredRecord);
+    writeLastPrice(filteredRecord);
 
-    if (current.price === null) {
+    if (current.variants.length === 0) {
         await sendDiscordAlert(
-            `⚠️ Eneba monitor: impossible de récupérer le prix (${current.timestamp}). Vérifier le blocage anti-bot.`
+            `⚠️ Eneba monitor: impossible de récupérer les prix (${current.timestamp}).`
         );
-        console.log('Échec de récupération, voir alerte envoyée.');
         return;
     }
+
+    if (profitableVariants.length === 0) {
+        console.log('Aucune carte rentable détectée.');
+        return;
+    }
+
+    const summary = profitableVariants
+        .map((v) => {
+            const faceValue = parseInt(v.valueLabel.match(/(\d+)/)?.[1] ?? '0');
+            const gain = faceValue - v.price! / 100;
+            return `${v.valueLabel}: ${(v.price! / 100).toFixed(2)}€ chez ${v.seller} (-${gain.toFixed(2)}€)`;
+        })
+        .join('\n');
 
     if (!previous) {
-        console.log('Premier relevé:', current);
+        console.log('Premier relevé, cartes rentables:', profitableVariants);
+        await sendDiscordAlert(`✅ Cartes rentables détectées (premier relevé):\n${summary}`);
         return;
     }
 
-    if (previous.price !== current.price) {
-        await sendDiscordAlert(
-            `💰 Changement de prix Eneba: ${previous.price} ${previous.currency} → ${current.price} ${current.currency}\n${PRODUCT_URL}`
-        );
+    const changes: string[] = [];
+    for (const variant of profitableVariants) {
+        const prevVariant = previous.variants.find((v: VariantPrice) => v.slug === variant.slug);
+        if (!prevVariant) {
+            changes.push(`🆕 Nouvelle carte rentable: ${variant.valueLabel} à ${(variant.price! / 100).toFixed(2)}€ chez ${variant.seller}`);
+        } else if (prevVariant.price !== variant.price) {
+            const prevLabel = prevVariant.price !== null ? (prevVariant.price / 100).toFixed(2) : 'N/A';
+            const currLabel = (variant.price! / 100).toFixed(2);
+            changes.push(`${variant.valueLabel}: ${prevLabel} → ${currLabel} ${variant.currency ?? ''}`);
+        }
     }
 
-    console.log('Relevé effectué:', current);
+    if (changes.length > 0) {
+        await sendDiscordAlert(`💰 Changements sur cartes rentables Eneba:\n${changes.join('\n')}`);
+    } else {
+        console.log('Cartes rentables inchangées:', profitableVariants);
+    }
 }
 
 main().catch(async (err) => {
