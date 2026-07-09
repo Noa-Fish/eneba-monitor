@@ -1,0 +1,18 @@
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# macOS
+.DS_Store
+
+# JetBrains
+.idea/
+
+# Output
+output/*.jsonl
+output/*.json
+!output/.gitkeep
+
+# Env
+.env
