@@ -27,7 +27,7 @@ jobs:
       - name: Run monitor
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: npx ts-node monitor.ts
+        run: npx ts-node src/index.ts
 
       - name: Commit results
         run: |
