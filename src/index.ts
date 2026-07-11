@@ -22,15 +22,48 @@ interface PriceRecord {
     variants: VariantPrice[];
 }
 
-async function sendDiscordAlert(message: string) {
+interface DiscordEmbedField {
+    name: string;
+    value: string;
+    inline?: boolean;
+}
+
+interface DiscordEmbed {
+    title: string;
+    url?: string;
+    description?: string;
+    color: number;
+    fields: DiscordEmbedField[];
+    timestamp: string;
+    footer: { text: string };
+}
+
+async function sendDiscordEmbeds(embeds: DiscordEmbed[]) {
     if (!DISCORD_WEBHOOK_URL) {
-        console.log('Pas de webhook configuré, alerte ignorée:', message);
+        console.log('Pas de webhook configuré, alertes ignorées:', embeds.map((e) => e.title));
+        return;
+    }
+    // Discord limite à 10 embeds par message, on envoie donc un message par embed
+    for (const embed of embeds) {
+        await fetch(DISCORD_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ embeds: [embed] }),
+        });
+        // petite pause pour éviter le rate-limit Discord
+        await new Promise((r) => setTimeout(r, 400));
+    }
+}
+
+async function sendDiscordText(content: string) {
+    if (!DISCORD_WEBHOOK_URL) {
+        console.log('Pas de webhook configuré, alerte ignorée:', content);
         return;
     }
     await fetch(DISCORD_WEBHOOK_URL, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ content: message }),
+        body: JSON.stringify({ content }),
     });
 }
 
@@ -135,6 +168,65 @@ function isProfitable(variant: VariantPrice): boolean {
     return variant.price < faceValueCents;
 }
 
+function buildProductUrl(slug: string): string {
+    return `https://www.eneba.com/${slug}`;
+}
+
+function getFaceValueCents(variant: VariantPrice): number {
+    const faceValue = parseInt(variant.valueLabel.match(/(\d+)/)?.[1] ?? '0');
+    return faceValue * 100;
+}
+
+function computeSavingsPercent(faceValueCents: number, price: number): number {
+    return ((faceValueCents - price) / faceValueCents) * 100;
+}
+
+function colorForSavings(pct: number): number {
+    if (pct >= 15) return 0x2ecc71; // vert vif — très bonne affaire
+    if (pct >= 5) return 0x57f287; // vert
+    return 0xfee75c; // jaune — rentable mais faible marge
+}
+
+function buildCardEmbed(
+    variant: VariantPrice,
+    headerEmoji: string,
+    headerLabel: string,
+    prevPrice?: number | null
+): DiscordEmbed {
+    const faceValueCents = getFaceValueCents(variant);
+    const faceValue = (faceValueCents / 100).toFixed(0);
+    const price = variant.price!;
+    const priceEur = (price / 100).toFixed(2);
+    const gain = ((faceValueCents - price) / 100).toFixed(2);
+    const pct = computeSavingsPercent(faceValueCents, price);
+    const url = buildProductUrl(variant.slug);
+
+    const fields: DiscordEmbedField[] = [
+        { name: 'Valeur faciale', value: `${faceValue} €`, inline: true },
+        { name: 'Prix payé', value: `**${priceEur} €**`, inline: true },
+        { name: 'Économie', value: `**${gain} €** (−${pct.toFixed(1)}%)`, inline: true },
+        { name: 'Vendeur', value: variant.seller ?? 'Inconnu', inline: true },
+        { name: 'En stock', value: variant.inStock ? '✅ Oui' : '❌ Non', inline: true },
+    ];
+
+    if (prevPrice !== undefined && prevPrice !== null) {
+        fields.push({
+            name: 'Ancien prix',
+            value: `${(prevPrice / 100).toFixed(2)} €`,
+            inline: true,
+        });
+    }
+
+    return {
+        title: `${headerEmoji} ${variant.valueLabel} — ${headerLabel}`,
+        url,
+        color: colorForSavings(pct),
+        fields,
+        timestamp: new Date().toISOString(),
+        footer: { text: 'Eneba Price Monitor · Auchan Gift Card' },
+    };
+}
+
 async function main() {
     const current = await checkPrice();
 
@@ -150,8 +242,8 @@ async function main() {
     writeLastPrice(filteredRecord);
 
     if (current.variants.length === 0) {
-        await sendDiscordAlert(
-            `⚠️ Eneba monitor: impossible de récupérer les prix (${current.timestamp}).`
+        await sendDiscordText(
+            `⚠️ **Eneba monitor**: impossible de récupérer les prix (${current.timestamp}). Vérifier le blocage anti-bot.`
         );
         return;
     }
@@ -161,41 +253,48 @@ async function main() {
         return;
     }
 
-    const summary = profitableVariants
-        .map((v) => {
-            const faceValue = parseInt(v.valueLabel.match(/(\d+)/)?.[1] ?? '0');
-            const gain = faceValue - v.price! / 100;
-            return `${v.valueLabel}: ${(v.price! / 100).toFixed(2)}€ chez ${v.seller} (-${gain.toFixed(2)}€)`;
-        })
-        .join('\n');
-
     if (!previous) {
+        const embeds = profitableVariants.map((v) => buildCardEmbed(v, '✅', 'Rentable'));
+        await sendDiscordEmbeds(embeds);
         console.log('Premier relevé, cartes rentables:', profitableVariants);
-        await sendDiscordAlert(`✅ Cartes rentables détectées (premier relevé):\n${summary}`);
         return;
     }
 
-    const changes: string[] = [];
+    const newlyProfitable: VariantPrice[] = [];
+    const changed: { variant: VariantPrice; prevPrice: number | null }[] = [];
+
     for (const variant of profitableVariants) {
         const prevVariant = previous.variants.find((v: VariantPrice) => v.slug === variant.slug);
         if (!prevVariant) {
-            changes.push(`🆕 Nouvelle carte rentable: ${variant.valueLabel} à ${(variant.price! / 100).toFixed(2)}€ chez ${variant.seller}`);
+            newlyProfitable.push(variant);
         } else if (prevVariant.price !== variant.price) {
-            const prevLabel = prevVariant.price !== null ? (prevVariant.price / 100).toFixed(2) : 'N/A';
-            const currLabel = (variant.price! / 100).toFixed(2);
-            changes.push(`${variant.valueLabel}: ${prevLabel} → ${currLabel} ${variant.currency ?? ''}`);
+            changed.push({ variant, prevPrice: prevVariant.price });
         }
     }
 
-    if (changes.length > 0) {
-        await sendDiscordAlert(`💰 Changements sur cartes rentables Eneba:\n${changes.join('\n')}`);
-    } else {
+    if (newlyProfitable.length > 0) {
+        await sendDiscordText(
+            `🆕 **${newlyProfitable.length} nouvelle(s) carte(s) rentable(s)** détectée(s) :`
+        );
+        const embeds = newlyProfitable.map((v) => buildCardEmbed(v, '🆕', 'Nouvelle'));
+        await sendDiscordEmbeds(embeds);
+    }
+
+    if (changed.length > 0) {
+        await sendDiscordText(`💰 **${changed.length} changement(s) de prix** détecté(s) :`);
+        const embeds = changed.map(({ variant, prevPrice }) =>
+            buildCardEmbed(variant, '💰', 'Prix modifié', prevPrice)
+        );
+        await sendDiscordEmbeds(embeds);
+    }
+
+    if (newlyProfitable.length === 0 && changed.length === 0) {
         console.log('Cartes rentables inchangées:', profitableVariants);
     }
 }
 
 main().catch(async (err) => {
     console.error(err);
-    await sendDiscordAlert(`❌ Eneba monitor: erreur script — ${err.message}`);
+    await sendDiscordText(`❌ **Eneba monitor**: erreur script — ${err.message}`);
     process.exit(1);
 });
