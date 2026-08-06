@@ -35,7 +35,7 @@ export const PRODUCT_SLUG =
 export const PRODUCT_URL =
     `https://www.eneba.com/fr/${PRODUCT_SLUG}`;
 
-export const MIN_PROFIT_PERCENT = 10;
+export const MIN_PROFIT_PERCENT = 0;
 
 export const DISCORD_PROFITABLE_WEBHOOK_URL =
     process.env.DISCORD_PROFITABLE_WEBHOOK_URL;
